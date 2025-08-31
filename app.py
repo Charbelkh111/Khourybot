@@ -10,7 +10,7 @@ app = Flask(__name__)
 CORS(app) 
 
 # ⚠️ قم بتحديث هذه القائمة بالمعرفات المسموح بها
-AUTHORIZED_USERS = ["64485064"]
+AUTHORIZED_USERS = ["66019874"]
 
 # يجب تحديد مسار pytesseract.exe إذا لم يكن في الـ PATH على الخادم
 # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
