@@ -1,6 +1,5 @@
-Flask
-Flask-Cors
+streamlit
+psycopg2-binary
+sqlalchemy
 pandas
-gunicorn
-Pillow
-pytesseract
+websocket-client
