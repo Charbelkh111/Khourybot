@@ -1,7 +1,8 @@
 import streamlit as st
 import sqlalchemy as sa
-from sqlalchemy.orm import sessionmaker, declarative_base # <-- استيراد declarative_base
-from sqlalchemy import Column, Integer, String, Float, Boolean, ForeignKey # <-- استيراد Column والأعمدة
+from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy import Column, Integer, String, Float, Boolean, ForeignKey
+from datetime import datetime
 import json
 import uuid
 import os
@@ -9,14 +10,15 @@ import time
 import streamlit.components.v1 as components
 
 # --- Database Setup ---
+# using the provided database URL directly in the code
 DATABASE_URL = "postgresql://bibokh_user:Ric9h1SaTADxdkV0LgNmF8c0RPWhWYzy@dpg-d30mrpogjchc73f1tiag-a.oregon-postgres.render.com/bibokh"
 engine = sa.create_engine(DATABASE_URL)
 Session = sessionmaker(bind=engine)
-Base = declarative_base() # <-- استخدام declarative_base المستوردة
+Base = declarative_base()
 
 class User(Base):
     __tablename__ = 'users'
-    id = Column(Integer, primary_key=True) # <-- Column معرف الآن
+    id = Column(Integer, primary_key=True)
     email = Column(String, unique=True, nullable=False)
 
 class BotSession(Base):
@@ -37,49 +39,79 @@ class BotSession(Base):
     initial_balance = Column(Float, nullable=True)
     logs = Column(String, default="[]")
 
-Base.metadata.create_all(engine) # <-- هذا سيقوم بإنشاء الجداول عند التشغيل
-
-# ... (باقي الكود كما هو) ...
+# --- Create tables if they don't exist ---
+# This is crucial for the first deployment
+Base.metadata.create_all(engine)
 
 # --- File-Based Authentication ---
 ALLOWED_EMAILS_FILE = 'user_ids.txt'
 
 def is_email_allowed(email):
+    """Checks if an email is present in the user_ids.txt file."""
     try:
         if os.path.exists(ALLOWED_EMAILS_FILE):
             with open(ALLOWED_EMAILS_FILE, 'r') as f:
-                allowed_emails = {line.strip() for line in f}
+                allowed_emails = {line.strip() for line in f if line.strip()} # Ensure no empty lines
                 return email in allowed_emails
         return False
-    except Exception:
+    except Exception as e:
+        print(f"Error reading {ALLOWED_EMAILS_FILE}: {e}")
         return False
 
 # --- Database Session Management ---
-def get_or_create_user(email):
+def get_or_create_user_and_session(email):
+    """
+    Checks if email is allowed, then gets or creates user and bot session.
+    Ensures user is created in DB only if allowed and returns session data.
+    """
+    if not is_email_allowed(email):
+        return None # Email not authorized
+
     s = Session()
     try:
         user = s.query(User).filter_by(email=email).first()
         if not user:
+            # User is allowed but not in DB yet, create them
             user = User(email=email)
             s.add(user)
+            # Commit immediately to get user ID for the session
             s.commit()
-        return user
-    finally:
-        s.close()
-
-def get_or_create_bot_session(user):
-    s = Session()
-    try:
+            
+        # Now that user is guaranteed to exist in DB (either found or just created)
+        # Fetch or create the bot session for this user
         bot_session = s.query(BotSession).filter_by(user_id=user.id).first()
         if not bot_session:
             bot_session = BotSession(user_id=user.id)
             s.add(bot_session)
             s.commit()
-        return bot_session
+            
+        # Load session data to be returned
+        session_data = {
+            'session_id': bot_session.session_id,
+            'api_token': bot_session.api_token,
+            'base_amount': bot_session.base_amount,
+            'tp_target': bot_session.tp_target,
+            'max_consecutive_losses': bot_session.max_consecutive_losses,
+            'current_amount': bot_session.current_amount,
+            'consecutive_losses': bot_session.consecutive_losses,
+            'total_wins': bot_session.total_wins,
+            'total_losses': bot_session.total_losses,
+            'is_running': bot_session.is_running,
+            'is_trade_open': bot_session.is_trade_open,
+            'initial_balance': bot_session.initial_balance,
+            'logs': json.loads(bot_session.logs) if bot_session.logs else [],
+        }
+        return session_data
+
+    except Exception as e:
+        s.rollback() # Rollback any partial changes
+        print(f"Error in get_or_create_user_and_session: {e}")
+        return None
     finally:
         s.close()
 
 def load_bot_state(session_id):
+    """Loads bot state from the database for a given session ID."""
     s = Session()
     try:
         bot_session = s.query(BotSession).filter_by(session_id=session_id).first()
@@ -103,6 +135,7 @@ def load_bot_state(session_id):
         s.close()
 
 def update_bot_settings(session_id, new_settings):
+    """Updates bot settings in the database for a given session ID."""
     s = Session()
     try:
         bot_session = s.query(BotSession).filter_by(session_id=session_id).first()
@@ -111,6 +144,9 @@ def update_bot_settings(session_id, new_settings):
                 if hasattr(bot_session, key):
                     setattr(bot_session, key, value)
             s.commit()
+    except Exception as e:
+        s.rollback()
+        print(f"Error updating bot settings for {session_id}: {e}")
     finally:
         s.close()
 
@@ -128,27 +164,29 @@ if not st.session_state.logged_in:
     st.title("KHOURYBOT Login 🤖")
     email = st.text_input("Enter your email address:")
     if st.button("Login", type="primary"):
-        if is_email_allowed(email):
-            user = get_or_create_user(email)
-            bot_session = get_or_create_bot_session(user)
+        session_info = get_or_create_user_and_session(email)
+        if session_info:
             st.session_state.user_email = email
-            st.session_state.session_id = bot_session.session_id
+            st.session_state.session_id = session_info['session_id']
             st.session_state.logged_in = True
-            st.session_state.session_data = load_bot_state(st.session_state.session_id)
+            st.session_state.session_data = session_info
             st.success("Login successful! Redirecting to bot control...")
             st.rerun()
         else:
-            st.error("Access denied. Your email is not activated.")
+            st.error("Access denied. Your email is not activated or an error occurred.")
 else:
     st.title("KHOURYBOT - Automated Trading 🤖")
     st.write(f"Logged in as: **{st.session_state.user_email}**")
     st.header("1. Bot Control")
+
+    # Reload state to ensure latest data is shown
     st.session_state.session_data = load_bot_state(st.session_state.session_id)
     current_status = "Running" if st.session_state.session_data.get('is_running') else "Stopped"
     is_session_active = st.session_state.session_data.get('api_token') is not None
     
+    # Display settings based on whether bot is running or not
     if not is_session_active or not current_status == "Running":
-        st.warning("Please enter new settings to start a new session.")
+        st.warning("Please enter your Deriv API token and settings to start a new session.")
         api_token = st.text_input("Enter your Deriv API token:", type="password", value=st.session_state.session_data.get('api_token', ''))
         base_amount = st.number_input("Base Amount ($)", min_value=0.5, step=0.5, value=st.session_state.session_data.get('base_amount', 0.5))
         tp_target = st.number_input("Take Profit Target ($)", min_value=1.0, step=1.0, value=st.session_state.session_data.get('tp_target', 1.0))
@@ -158,7 +196,7 @@ else:
         base_amount = st.session_state.session_data.get('base_amount')
         tp_target = st.session_state.session_data.get('tp_target')
         max_losses = st.session_state.session_data.get('max_consecutive_losses')
-        st.write(f"**API Token:** {'********'}")
+        st.write(f"**API Token:** {'********'}") # Mask token
         st.write(f"**Base Amount:** {base_amount}$")
         st.write(f"**TP Target:** {tp_target}$")
         st.write(f"**Max Losses:** {max_losses}")
@@ -188,11 +226,13 @@ else:
         st.rerun()
 
     st.info(f"Bot Status: **{'Running' if current_status == 'Running' else 'Stopped'}**")
+
     st.markdown("---")
     st.header("2. Live Bot Logs")
     logs = st.session_state.session_data.get('logs', [])
     with st.container(height=600):
         st.text_area("Logs", "\n".join(logs), height=600, key="logs_textarea")
     
-    time.sleep(5) # Refresh every 5 seconds
+    # Refresh the UI every 5 seconds to get the latest logs
+    time.sleep(5)
     st.rerun()
