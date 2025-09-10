@@ -1,8 +1,7 @@
 import streamlit as st
-# Modified import for declarative_base
-from sqlalchemy.orm import sessionmaker, declarative_base 
 import sqlalchemy as sa
-from datetime import datetime
+from sqlalchemy.orm import sessionmaker, declarative_base # <-- استيراد declarative_base
+from sqlalchemy import Column, Integer, String, Float, Boolean, ForeignKey # <-- استيراد Column والأعمدة
 import json
 import uuid
 import os
@@ -12,15 +11,12 @@ import streamlit.components.v1 as components
 # --- Database Setup ---
 DATABASE_URL = "postgresql://khourybotes_db_user:HeAQEQ68txKKjTVQkDva3yaMx3npqTuw@dpg-d2uvmvogjchc73ao6060-a/khourybotes_db"
 engine = sa.create_engine(DATABASE_URL)
-
-# --- Correct import for declarative_base ---
-Base = declarative_base() 
-
 Session = sessionmaker(bind=engine)
+Base = declarative_base() # <-- استخدام declarative_base المستوردة
 
 class User(Base):
     __tablename__ = 'users'
-    id = Column(Integer, primary_key=True)
+    id = Column(Integer, primary_key=True) # <-- Column معرف الآن
     email = Column(String, unique=True, nullable=False)
 
 class BotSession(Base):
@@ -41,9 +37,9 @@ class BotSession(Base):
     initial_balance = Column(Float, nullable=True)
     logs = Column(String, default="[]")
 
-# --- IMPORTANT: Create tables if they don't exist ---
-# This ensures the tables are created when the app starts, especially if the DB was empty.
-Base.metadata.create_all(engine) 
+Base.metadata.create_all(engine) # <-- هذا سيقوم بإنشاء الجداول عند التشغيل
+
+# ... (باقي الكود كما هو) ...
 
 # --- File-Based Authentication ---
 ALLOWED_EMAILS_FILE = 'user_ids.txt'
@@ -197,5 +193,6 @@ else:
     logs = st.session_state.session_data.get('logs', [])
     with st.container(height=600):
         st.text_area("Logs", "\n".join(logs), height=600, key="logs_textarea")
-    time.sleep(5)
+    
+    time.sleep(5) # Refresh every 5 seconds
     st.rerun()
