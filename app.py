@@ -1,7 +1,7 @@
 import streamlit as st
+# Modified import for declarative_base
+from sqlalchemy.orm import sessionmaker, declarative_base 
 import sqlalchemy as sa
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey
 from datetime import datetime
 import json
 import uuid
@@ -12,8 +12,11 @@ import streamlit.components.v1 as components
 # --- Database Setup ---
 DATABASE_URL = "postgresql://khourybotes_db_user:HeAQEQ68txKKjTVQkDva3yaMx3npqTuw@dpg-d2uvmvogjchc73ao6060-a/khourybotes_db"
 engine = sa.create_engine(DATABASE_URL)
+
+# --- Correct import for declarative_base ---
+Base = declarative_base() 
+
 Session = sessionmaker(bind=engine)
-Base = sa.declarative_base()
 
 class User(Base):
     __tablename__ = 'users'
@@ -38,7 +41,9 @@ class BotSession(Base):
     initial_balance = Column(Float, nullable=True)
     logs = Column(String, default="[]")
 
-Base.metadata.create_all(engine)
+# --- IMPORTANT: Create tables if they don't exist ---
+# This ensures the tables are created when the app starts, especially if the DB was empty.
+Base.metadata.create_all(engine) 
 
 # --- File-Based Authentication ---
 ALLOWED_EMAILS_FILE = 'user_ids.txt'
