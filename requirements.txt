@@ -1,5 +1,3 @@
-streamlit
-psycopg2-binary
-sqlalchemy
-pandas
-websocket-client
+Flask==3.0.0
+websocket-client==1.6.4
+gunicorn==21.2.0
