@@ -1,238 +1,210 @@
-import streamlit as st
-import sqlalchemy as sa
-from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, String, Float, Boolean, ForeignKey
-from datetime import datetime
-import json
-import uuid
 import os
+import json
 import time
-import streamlit.components.v1 as components
+import threading
+from flask import Flask, jsonify, render_template_string, request
+import websocket
+from datetime import datetime, timedelta
 
-# --- Database Setup ---
-# using the provided database URL directly in the code
-DATABASE_URL = "postgresql://bibokh_user:Ric9h1SaTADxdkV0LgNmF8c0RPWhWYzy@dpg-d30mrpogjchc73f1tiag-a.oregon-postgres.render.com/bibokh"
-engine = sa.create_engine(DATABASE_URL)
-Session = sessionmaker(bind=engine)
-Base = declarative_base()
+app = Flask(__name__)
 
-class User(Base):
-    __tablename__ = 'users'
-    id = Column(Integer, primary_key=True)
-    email = Column(String, unique=True, nullable=False)
+# --- إعدادات النظام ---
+bot_config = {
+    "isRunning": False,
+    "displayMsg": "WAITING",
+    "direction": "",
+    "strength": 0,
+    "pair_name": "EUR/USD",
+    "pair_id": "frxEURUSD",
+    "timestamp": 0,
+    "entryTime": "",
+    "isSignal": False,
+    "logs": []
+}
 
-class BotSession(Base):
-    __tablename__ = 'bot_sessions'
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
-    session_id = Column(String, unique=True, nullable=False, default=lambda: str(uuid.uuid4()))
-    api_token = Column(String, nullable=True)
-    base_amount = Column(Float, default=0.5)
-    tp_target = Column(Float, nullable=True)
-    max_consecutive_losses = Column(Integer, default=5)
-    current_amount = Column(Float, default=0.5)
-    consecutive_losses = Column(Integer, default=0)
-    total_wins = Column(Integer, default=0)
-    total_losses = Column(Integer, default=0)
-    is_running = Column(Boolean, default=False)
-    is_trade_open = Column(Boolean, default=False)
-    initial_balance = Column(Float, nullable=True)
-    logs = Column(String, default="[]")
+ASSETS = {
+    "frxEURUSD": "EUR/USD", 
+    "frxEURJPY": "EUR/JPY", 
+    "frxEURGBP": "EUR/GBP",
+    "frxGBPUSD": "GBP/USD",
+    "frxUSDJPY": "USD/JPY"
+}
 
-# --- Create tables if they don't exist ---
-# This is crucial for the first deployment
-Base.metadata.create_all(engine)
+def add_log(msg):
+    bot_config["logs"].append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+    if len(bot_config["logs"]) > 5: bot_config["logs"].pop(0)
 
-# --- File-Based Authentication ---
-ALLOWED_EMAILS_FILE = 'user_ids.txt'
+# --- محرك الحسابات الرياضية ---
+def calculate_rsi(prices, period=14):
+    if len(prices) < period + 1: return 50
+    deltas = [prices[i+1] - prices[i] for i in range(len(prices)-1)]
+    up = sum([max(d, 0) for d in deltas[-period:]]) / period
+    down = sum([max(-d, 0) for d in deltas[-period:]]) / period
+    if down == 0: return 100
+    rs = up / down
+    return 100 - (100 / (1 + rs))
 
-def is_email_allowed(email):
-    """Checks if an email is present in the user_ids.txt file."""
-    try:
-        if os.path.exists(ALLOWED_EMAILS_FILE):
-            with open(ALLOWED_EMAILS_FILE, 'r') as f:
-                allowed_emails = {line.strip() for line in f if line.strip()} # Ensure no empty lines
-                return email in allowed_emails
-        return False
-    except Exception as e:
-        print(f"Error reading {ALLOWED_EMAILS_FILE}: {e}")
-        return False
-
-# --- Database Session Management ---
-def get_or_create_user_and_session(email):
-    """
-    Checks if email is allowed, then gets or creates user and bot session.
-    Ensures user is created in DB only if allowed and returns session data.
-    """
-    if not is_email_allowed(email):
-        return None # Email not authorized
-
-    s = Session()
-    try:
-        user = s.query(User).filter_by(email=email).first()
-        if not user:
-            # User is allowed but not in DB yet, create them
-            user = User(email=email)
-            s.add(user)
-            # Commit immediately to get user ID for the session
-            s.commit()
-            
-        # Now that user is guaranteed to exist in DB (either found or just created)
-        # Fetch or create the bot session for this user
-        bot_session = s.query(BotSession).filter_by(user_id=user.id).first()
-        if not bot_session:
-            bot_session = BotSession(user_id=user.id)
-            s.add(bot_session)
-            s.commit()
-            
-        # Load session data to be returned
-        session_data = {
-            'session_id': bot_session.session_id,
-            'api_token': bot_session.api_token,
-            'base_amount': bot_session.base_amount,
-            'tp_target': bot_session.tp_target,
-            'max_consecutive_losses': bot_session.max_consecutive_losses,
-            'current_amount': bot_session.current_amount,
-            'consecutive_losses': bot_session.consecutive_losses,
-            'total_wins': bot_session.total_wins,
-            'total_losses': bot_session.total_losses,
-            'is_running': bot_session.is_running,
-            'is_trade_open': bot_session.is_trade_open,
-            'initial_balance': bot_session.initial_balance,
-            'logs': json.loads(bot_session.logs) if bot_session.logs else [],
-        }
-        return session_data
-
-    except Exception as e:
-        s.rollback() # Rollback any partial changes
-        print(f"Error in get_or_create_user_and_session: {e}")
-        return None
-    finally:
-        s.close()
-
-def load_bot_state(session_id):
-    """Loads bot state from the database for a given session ID."""
-    s = Session()
-    try:
-        bot_session = s.query(BotSession).filter_by(session_id=session_id).first()
-        if bot_session:
-            return {
-                'api_token': bot_session.api_token,
-                'base_amount': bot_session.base_amount,
-                'tp_target': bot_session.tp_target,
-                'max_consecutive_losses': bot_session.max_consecutive_losses,
-                'current_amount': bot_session.current_amount,
-                'consecutive_losses': bot_session.consecutive_losses,
-                'total_wins': bot_session.total_wins,
-                'total_losses': bot_session.total_losses,
-                'is_running': bot_session.is_running,
-                'is_trade_open': bot_session.is_trade_open,
-                'initial_balance': bot_session.initial_balance,
-                'logs': json.loads(bot_session.logs) if bot_session.logs else [],
-            }
-        return {}
-    finally:
-        s.close()
-
-def update_bot_settings(session_id, new_settings):
-    """Updates bot settings in the database for a given session ID."""
-    s = Session()
-    try:
-        bot_session = s.query(BotSession).filter_by(session_id=session_id).first()
-        if bot_session:
-            for key, value in new_settings.items():
-                if hasattr(bot_session, key):
-                    setattr(bot_session, key, value)
-            s.commit()
-    except Exception as e:
-        s.rollback()
-        print(f"Error updating bot settings for {session_id}: {e}")
-    finally:
-        s.close()
-
-# --- Streamlit UI ---
-if 'logged_in' not in st.session_state:
-    st.session_state.logged_in = False
-if 'user_email' not in st.session_state:
-    st.session_state.user_email = None
-if 'session_id' not in st.session_state:
-    st.session_state.session_id = None
-if 'session_data' not in st.session_state:
-    st.session_state.session_data = {}
-
-if not st.session_state.logged_in:
-    st.title("KHOURYBOT Login 🤖")
-    email = st.text_input("Enter your email address:")
-    if st.button("Login", type="primary"):
-        session_info = get_or_create_user_and_session(email)
-        if session_info:
-            st.session_state.user_email = email
-            st.session_state.session_id = session_info['session_id']
-            st.session_state.logged_in = True
-            st.session_state.session_data = session_info
-            st.success("Login successful! Redirecting to bot control...")
-            st.rerun()
-        else:
-            st.error("Access denied. Your email is not activated or an error occurred.")
-else:
-    st.title("KHOURYBOT - Automated Trading 🤖")
-    st.write(f"Logged in as: **{st.session_state.user_email}**")
-    st.header("1. Bot Control")
-
-    # Reload state to ensure latest data is shown
-    st.session_state.session_data = load_bot_state(st.session_state.session_id)
-    current_status = "Running" if st.session_state.session_data.get('is_running') else "Stopped"
-    is_session_active = st.session_state.session_data.get('api_token') is not None
+def perform_analysis(ticks, times, asset_id):
+    global bot_config
     
-    # Display settings based on whether bot is running or not
-    if not is_session_active or not current_status == "Running":
-        st.warning("Please enter your Deriv API token and settings to start a new session.")
-        api_token = st.text_input("Enter your Deriv API token:", type="password", value=st.session_state.session_data.get('api_token', ''))
-        base_amount = st.number_input("Base Amount ($)", min_value=0.5, step=0.5, value=st.session_state.session_data.get('base_amount', 0.5))
-        tp_target = st.number_input("Take Profit Target ($)", min_value=1.0, step=1.0, value=st.session_state.session_data.get('tp_target', 1.0))
-        max_losses = st.number_input("Max Consecutive Losses", min_value=1, step=1, value=st.session_state.session_data.get('max_consecutive_losses', 5))
+    # 1. تحويل 1000 تيك إلى شموع دقيقة (كل 60 تيك = شمعة) لـ RSI
+    candle_closes = [ticks[i] for i in range(59, len(ticks), 60)]
+    rsi_val = calculate_rsi(candle_closes, 14)
+    
+    current_price = ticks[-1]
+    now = datetime.now()
+    
+    # 2. تحديد الأسعار المرجعية للاتجاه
+    start_of_5m = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
+    start_of_1m = now.replace(second=0, microsecond=0)
+    
+    price_at_5m = next((ticks[i] for i, t in enumerate(times) if datetime.fromtimestamp(int(t)) >= start_of_5m), ticks[0])
+    price_at_1m = next((ticks[i] for i, t in enumerate(times) if datetime.fromtimestamp(int(t)) >= start_of_1m), ticks[-60] if len(ticks) > 60 else ticks[0])
+
+    # 3. التحقق من توافق الشروط (RSI + M5 Candle + M1 Candle)
+    is_call = (rsi_val > 50) and (current_price > price_at_5m) and (current_price > price_at_1m)
+    is_put = (rsi_val < 50) and (current_price < price_at_5m) and (current_price < price_at_1m)
+
+    next_entry = (now + timedelta(seconds=10)).strftime("%H:%M")
+
+    if is_call:
+        bot_config.update({
+            "displayMsg": "SIGNAL FOUND", "isSignal": True, "direction": "CALL 🟢",
+            "strength": round(rsi_val, 1), "pair_name": ASSETS[asset_id],
+            "timestamp": time.time(), "entryTime": next_entry
+        })
+        add_log(f"STRATEGY MATCH: CALL (RSI:{rsi_val:.1f})")
+    elif is_put:
+        bot_config.update({
+            "displayMsg": "SIGNAL FOUND", "isSignal": True, "direction": "PUT 🔴",
+            "strength": round(100 - rsi_val, 1), "pair_name": ASSETS[asset_id],
+            "timestamp": time.time(), "entryTime": next_entry
+        })
+        add_log(f"STRATEGY MATCH: PUT (RSI:{rsi_val:.1f})")
     else:
-        api_token = st.session_state.session_data.get('api_token')
-        base_amount = st.session_state.session_data.get('base_amount')
-        tp_target = st.session_state.session_data.get('tp_target')
-        max_losses = st.session_state.session_data.get('max_consecutive_losses')
-        st.write(f"**API Token:** {'********'}") # Mask token
-        st.write(f"**Base Amount:** {base_amount}$")
-        st.write(f"**TP Target:** {tp_target}$")
-        st.write(f"**Max Losses:** {max_losses}")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        start_button = st.button("Start Bot", type="primary", disabled=(current_status == 'Running' or not api_token))
-    with col2:
-        stop_button = st.button("Stop Bot", disabled=(current_status == 'Stopped'))
+        bot_config.update({"displayMsg": "NO SIGNAL", "isSignal": False, "timestamp": time.time()})
+        add_log(f"ANALYZED: RSI {rsi_val:.1f} - No Alignment")
 
-    if start_button:
-        new_settings = {
-            'is_running': True, 'api_token': api_token, 'base_amount': base_amount, 'tp_target': tp_target,
-            'max_consecutive_losses': max_losses, 'current_amount': base_amount, 'consecutive_losses': 0,
-            'total_wins': 0, 'total_losses': 0, 'initial_balance': None,
-            'logs': json.dumps([f"[{datetime.now().strftime('%H:%M:%S')}] 🟢 Bot has been started."])
+# --- نظام جلب البيانات ---
+def smart_ws_worker():
+    while True:
+        now = datetime.now()
+        # الفحص كل 5 دقائق عند الثانية 50 (قبل الشمعة الجديدة بـ 10 ثوانٍ)
+        if bot_config["isRunning"] and (now.minute % 5 == 4) and (now.second == 50):
+            try:
+                ws = websocket.create_connection("wss://blue.derivws.com/websockets/v3?app_id=16929", timeout=15)
+                ws.send(json.dumps({"ticks_history": bot_config["pair_id"], "count": 1000, "end": "latest", "style": "ticks"}))
+                res = json.loads(ws.recv())
+                if "history" in res:
+                    perform_analysis(res["history"]["prices"], res["history"]["times"], bot_config["pair_id"])
+                ws.close()
+                time.sleep(5)
+            except Exception as e:
+                add_log(f"Socket Error: {str(e)}")
+        time.sleep(0.5)
+
+# --- الواجهة الرسومية ---
+UI = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>KHOURY M5-RSI PRO</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        :root { --neon: #00f3ff; --green: #39ff14; --red: #ff4757; }
+        body { background: #06070a; color: white; font-family: 'Segoe UI', sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+        #login { position: fixed; inset: 0; background: #020617; z-index: 2000; display: flex; flex-direction: column; justify-content: center; align-items: center; }
+        .box { background: rgba(0,243,255,0.02); padding: 30px; border-radius: 20px; border: 1px solid var(--neon); text-align: center; width: 320px; box-shadow: 0 0 20px rgba(0,243,255,0.1); }
+        input, select { background: #000; border: 1px solid #333; color: var(--neon); padding: 12px; width: 90%; margin-bottom: 15px; border-radius: 8px; outline: none; text-align: center; font-size: 16px; }
+        .btn { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--neon); background: transparent; color: var(--neon); font-weight: bold; cursor: pointer; transition: 0.3s; }
+        .btn:hover { background: var(--neon); color: black; box-shadow: 0 0 15px var(--neon); }
+        #dash { display: none; width: 90%; max-width: 400px; text-align: center; }
+        .clock { font-size: 45px; color: var(--neon); margin: 10px 0; text-shadow: 0 0 10px var(--neon); font-weight: bold; }
+        .display-area { border: 2px solid var(--neon); padding: 25px; border-radius: 20px; margin: 20px 0; background: rgba(0,243,255,0.05); min-height: 200px; display: flex; align-items: center; justify-content: center; }
+        .sig-card { text-align: left; width: 100%; font-family: monospace; font-size: 16px; }
+        .logs { background: #000; height: 100px; padding: 10px; font-size: 11px; overflow-y: auto; color: #888; border-radius: 10px; text-align: left; border: 1px solid #111; margin-top: 15px; }
+    </style>
+</head>
+<body>
+    <div id="login">
+        <div class="box">
+            <h2 style="color: var(--neon); letter-spacing: 2px;">KHOURY BOT</h2>
+            <input type="text" id="u" placeholder="USER ID">
+            <input type="password" id="p" placeholder="PASSWORD">
+            <button class="btn" onclick="check()">UNLOCK SYSTEM</button>
+        </div>
+    </div>
+    <div id="dash">
+        <h2 style="color: var(--neon); margin-bottom: 5px;">M5 RSI ALGORITHM</h2>
+        <div style="font-size: 12px; color: #555; margin-bottom: 15px;">STRATEGY: RSI(14) + SYNC TREND</div>
+        <select id="asset">
+            {% for id, name in assets.items() %}
+            <option value="{{id}}">{{name}}</option>
+            {% endfor %}
+        </select>
+        <div class="clock" id="clk">00:00:00</div>
+        <div style="display:flex; gap:10px; margin-bottom:20px;">
+            <button class="btn" style="color:var(--green); border-color:var(--green);" onclick="ctl('start')">START BOT</button>
+            <button class="btn" style="color:var(--red); border-color:var(--red);" onclick="ctl('stop')">STOP BOT</button>
+        </div>
+        <div class="display-area" id="mainDisp"></div>
+        <div class="logs" id="lBox"></div>
+    </div>
+    <script>
+        function check() {
+            if(document.getElementById('u').value==='KHOURYBOT' && document.getElementById('p').value==='123456') {
+                document.getElementById('login').style.display='none';
+                document.getElementById('dash').style.display='block';
+                setInterval(upd, 1000);
+            } else alert('Unauthorized Access');
         }
-        update_bot_settings(st.session_state.session_id, new_settings)
-        st.success("Bot has been started.")
-        st.rerun()
+        async function ctl(a) { await fetch(`/api/cmd?action=${a}&pair=${document.getElementById('asset').value}`); }
+        async function upd() {
+            document.getElementById('clk').innerText = new Date().toTimeString().split(' ')[0];
+            const r = await fetch('/api/status');
+            const d = await r.json();
+            const disp = document.getElementById('mainDisp');
+            if(d.show) {
+                if(d.isSignal) {
+                    disp.innerHTML = `<div class="sig-card">
+                        <b style="color:var(--neon)">ASSET:</b> ${d.pair}<br>
+                        <b style="color:var(--neon)">SIGNAL:</b> <span style="font-size:20px">${d.signal}</span><br>
+                        <b style="color:var(--neon)">POWER:</b> ${d.strength}%<br>
+                        <b style="color:var(--neon)">ENTRY:</b> ${d.entry}<br>
+                        <b style="color:var(--neon)">EXPIRY:</b> 1 MINUTE
+                    </div>`;
+                } else { disp.innerHTML = `<div style="font-size:24px; color:#444">WAITING FOR SETUP</div>`; }
+            } else { 
+                let m = new Date().getMinutes();
+                let wait = 4 - (m % 5);
+                disp.innerHTML = `<div style="color:#444;">${d.run ? "SCANNING MARKET... (Next scan in " + wait + "m)" : "SYSTEM OFFLINE"}</div>`; 
+            }
+            document.getElementById('lBox').innerHTML = d.logs.join('<br>');
+        }
+    </script>
+</body>
+</html>
+"""
 
-    if stop_button:
-        logs = st.session_state.session_data.get('logs', [])
-        logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] 🛑 Bot stopped by user.")
-        update_bot_settings(st.session_state.session_id, {'is_running': False, 'logs': json.dumps(logs)})
-        st.warning("Bot has been stopped.")
-        st.rerun()
+@app.route('/')
+def home(): return render_template_string(UI, assets=ASSETS)
 
-    st.info(f"Bot Status: **{'Running' if current_status == 'Running' else 'Stopped'}**")
+@app.route('/api/cmd')
+def cmd():
+    bot_config["isRunning"] = (request.args.get('action') == 'start')
+    bot_config["pair_id"] = request.args.get('pair')
+    bot_config["pair_name"] = ASSETS.get(bot_config["pair_id"], "Unknown")
+    return jsonify({"ok": True})
 
-    st.markdown("---")
-    st.header("2. Live Bot Logs")
-    logs = st.session_state.session_data.get('logs', [])
-    with st.container(height=600):
-        st.text_area("Logs", "\n".join(logs), height=600, key="logs_textarea")
-    
-    # Refresh the UI every 5 seconds to get the latest logs
-    time.sleep(5)
-    st.rerun()
+@app.route('/api/status')
+def get_status():
+    show = (time.time() - bot_config["timestamp"]) < 60 and bot_config["timestamp"] > 0
+    return jsonify({
+        "run": bot_config["isRunning"], "show": show, "isSignal": bot_config["isSignal"],
+        "signal": bot_config["direction"], "strength": bot_config["strength"],
+        "pair": bot_config["pair_name"], "entry": bot_config["entryTime"], "logs": bot_config["logs"]
+    })
+
+if __name__ == "__main__":
+    threading.Thread(target=smart_ws_worker, daemon=True).start()
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
