@@ -8,171 +8,109 @@ from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
-# --- إعدادات النظام ---
+# إعدادات البوت
 bot_config = {
     "isRunning": False,
-    "displayMsg": "WAITING",
-    "direction": "",
-    "reason": "Initializing...",
-    "strength": 0,
-    "pair_name": "",
+    "direction": "في انتظار التحليل",
+    "reason": "سيتم الفحص عند الثانية 50",
     "pair_id": "frxEURUSD",
     "timestamp": 0,
-    "entryTime": "",
-    "isSignal": False,
-    "logs": []
+    "isSignal": False
 }
 
 ASSETS = {"frxEURUSD": "EUR/USD", "frxEURJPY": "EUR/JPY", "frxEURGBP": "EUR/GBP"}
 
-def add_log(msg):
-    bot_config["logs"].append(f"[{time.strftime('%H:%M:%S')}] {msg}")
-    if len(bot_config["logs"]) > 5: bot_config["logs"].pop(0)
-
-# --- حساب مؤشر RSI ---
-def calculate_rsi(prices, period=14):
+# دالة حساب RSI مبسطة لضمان عدم التعليق
+def get_rsi(prices, period=14):
     if len(prices) < period + 1: return 50
-    deltas = [prices[i+1] - prices[i] for i in range(len(prices)-1)]
-    up = sum([max(d, 0) for d in deltas[-period:]]) / period
-    down = sum([max(-d, 0) for d in deltas[-period:]]) / period
+    up, down = 0, 0
+    for i in range(len(prices)-period, len(prices)):
+        diff = prices[i] - prices[i-1]
+        if diff > 0: up += diff
+        else: down -= diff
     if down == 0: return 100
     rs = up / down
     return 100 - (100 / (1 + rs))
 
-# --- محرك التحليل (RSI + M5 + M1) ---
-def perform_analysis(ticks, times, asset_id):
+def run_analysis():
     global bot_config
-    
-    # تحويل التيكات لشموع دقيقة لـ RSI
-    candle_closes = [ticks[i] for i in range(59, len(ticks), 60)]
-    rsi_val = calculate_rsi(candle_closes, 14)
-    current_price = ticks[-1]
-    now = datetime.now()
-    
-    # تحديد أسعار البداية لـ 5 دقائق و 1 دقيقة
-    start_of_5m = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
-    start_of_1m = now.replace(second=0, microsecond=0)
-    
-    price_at_5m = next((ticks[i] for i, t in enumerate(times) if datetime.fromtimestamp(int(t)) >= start_of_5m), ticks[0])
-    price_at_1m = next((ticks[i] for i, t in enumerate(times) if datetime.fromtimestamp(int(t)) >= start_of_1m), ticks[-60] if len(ticks) > 60 else ticks[0])
+    try:
+        # اتصال سريع لجلب البيانات
+        ws = websocket.create_connection("wss://blue.derivws.com/websockets/v3?app_id=16929", timeout=10)
+        ws.send(json.dumps({"ticks_history": bot_config["pair_id"], "count": 200, "end": "latest", "style": "ticks"}))
+        res = json.loads(ws.recv())
+        ws.close()
 
-    # شروط الاستراتيجية
-    is_call = (rsi_val > 50) and (current_price > price_at_5m) and (current_price > price_at_1m)
-    is_put = (rsi_val < 50) and (current_price < price_at_5m) and (current_price < price_at_1m)
+        prices = res["history"]["prices"]
+        rsi_val = get_rsi(prices)
+        current_price = prices[-1]
+        open_price = prices[0] # سعر البداية للمقارنة
 
-    reason = "Success"
-    if not (is_call or is_put):
-        if abs(rsi_val - 50) < 5: reason = f"RSI Neutral ({round(rsi_val,1)})"
-        elif rsi_val > 50 and current_price < price_at_5m: reason = "M5 Candle is Red"
-        elif rsi_val < 50 and current_price > price_at_5m: reason = "M5 Candle is Green"
-        else: reason = "M1/M5 Mismatch"
+        # شروط الإشارة
+        is_call = (rsi_val > 50) and (current_price > open_price)
+        is_put = (rsi_val < 50) and (current_price < open_price)
 
-    next_entry = (now + timedelta(seconds=10)).strftime("%H:%M")
+        # تحديث الحالة
+        bot_config.update({
+            "isSignal": is_call or is_put,
+            "direction": "شراء (CALL) 🟢" if is_call else ("بيع (PUT) 🔴" if is_put else "لا توجد إشارة"),
+            "reason": "الاتجاه متوافق مع RSI" if (is_call or is_put) else f"RSI: {round(rsi_val,1)} (غير كافي)",
+            "timestamp": time.time()
+        })
+    except:
+        bot_config["reason"] = "خطأ في الاتصال بالسوق"
 
-    bot_config.update({
-        "displayMsg": "SIGNAL FOUND" if (is_call or is_put) else "NO SIGNAL",
-        "isSignal": is_call or is_put,
-        "direction": "CALL 🟢" if is_call else ("PUT 🔴" if is_put else "WAITING"),
-        "reason": reason,
-        "strength": round(rsi_val, 1) if is_call else round(100 - rsi_val, 1),
-        "pair_name": ASSETS[asset_id],
-        "timestamp": time.time(),
-        "entryTime": next_entry if (is_call or is_put) else ""
-    })
-    add_log(f"Analysis: {bot_config['direction']} | {reason}")
-
-# --- نظام WebSocket (كل 5 دقائق عند الثانية 50) ---
-def smart_ws_worker():
+def worker():
     while True:
         now = datetime.now()
-        # يعمل كل 5 دقائق عند الدقيقة 4, 9, 14...
-        if bot_config["isRunning"] and (now.minute % 5 == 4) and (now.second == 50):
-            try:
-                ws = websocket.create_connection("wss://blue.derivws.com/websockets/v3?app_id=16929", timeout=15)
-                asset = bot_config["pair_id"]
-                ws.send(json.dumps({"ticks_history": asset, "count": 1000, "end": "latest", "style": "ticks"}))
-                res = json.loads(ws.recv())
-                if "history" in res:
-                    perform_analysis(res["history"]["prices"], res["history"]["times"], asset)
-                ws.close()
-                time.sleep(5)
-            except Exception as e:
-                add_log(f"Socket Error: {str(e)}")
+        # الفحص عند الثانية 50 من كل دقيقة
+        if bot_config["isRunning"] and now.second == 50:
+            run_analysis()
+            time.sleep(5) # منع التكرار
         time.sleep(0.5)
 
-# --- الواجهة الرسومية ---
 UI = """
 <!DOCTYPE html>
-<html>
+<html dir="rtl">
 <head>
-    <title>KHOURY AI PRO</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="UTF-8">
+    <title>بوت خوري المطور</title>
     <style>
-        :root { --neon: #00f3ff; --green: #39ff14; --red: #ff4757; }
-        body { background: #06070a; color: white; font-family: 'Courier New', monospace; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
-        #login { position: fixed; inset: 0; background: #020617; z-index: 2000; display: flex; flex-direction: column; justify-content: center; align-items: center; }
-        .box { background: rgba(0,243,255,0.02); padding: 30px; border-radius: 20px; border: 1px solid var(--neon); text-align: center; width: 300px; }
-        input, select { background: #000; border: 1px solid #333; color: var(--neon); padding: 12px; width: 100%; margin-bottom: 15px; border-radius: 8px; text-align: center; }
-        .btn { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--neon); background: transparent; color: var(--neon); font-weight: bold; cursor: pointer; }
-        #dash { display: none; width: 90%; max-width: 400px; text-align: center; }
-        .clock { font-size: 40px; color: var(--neon); margin: 15px 0; }
-        .display-area { border: 2px solid var(--neon); padding: 25px; border-radius: 20px; margin: 20px 0; background: rgba(0,243,255,0.05); min-height: 200px; display: flex; flex-direction: column; justify-content: center; }
-        .logs { background: #000; height: 90px; padding: 10px; font-size: 10px; overflow-y: auto; color: var(--green); border-radius: 10px; text-align: left; border: 1px solid #111; }
+        body { background: #0b0e14; color: white; font-family: Arial; text-align: center; padding-top: 50px; }
+        .card { border: 2px solid #00f3ff; display: inline-block; padding: 30px; border-radius: 20px; background: #161b22; box-shadow: 0 0 20px #00f3ff44; }
+        .timer { font-size: 50px; color: #00f3ff; margin: 20px 0; }
+        .btn { padding: 10px 30px; font-size: 18px; cursor: pointer; border-radius: 10px; border: none; margin: 5px; }
+        .start { background: #00ff88; color: black; }
+        .stop { background: #ff4444; color: white; }
+        #result { margin-top: 20px; font-size: 20px; border-top: 1px solid #333; padding-top: 15px; }
     </style>
 </head>
 <body>
-    <div id="login">
-        <div class="box">
-            <h2 style="color: var(--neon)">KHOURY PRO</h2>
-            <input type="text" id="u" placeholder="ID">
-            <input type="password" id="p" placeholder="PASSWORD">
-            <button class="btn" onclick="check()">LOGIN</button>
-        </div>
-    </div>
-    <div id="dash">
-        <h2 style="color: var(--neon)">RSI TREND AI</h2>
-        <select id="asset">
-            <option value="frxEURUSD">EUR/USD</option>
-            <option value="frxEURJPY">EUR/JPY</option>
-            <option value="frxEURGBP">EUR/GBP</option>
-        </select>
-        <div class="clock" id="clk">00:00:00</div>
-        <div style="display:flex; gap:10px; margin-bottom:20px;">
-            <button class="btn" style="color:var(--green); border-color:var(--green);" onclick="ctl('start')">START</button>
-            <button class="btn" style="color:var(--red); border-color:var(--red);" onclick="ctl('stop')">STOP</button>
-        </div>
-        <div class="display-area" id="mainDisp"></div>
-        <div class="logs" id="lBox"></div>
+    <div class="card">
+        <h2>تحليل RSI + Trend</h2>
+        <div class="timer" id="timer">00</div>
+        <button class="btn start" onclick="ctl('start')">تشغيل البوت</button>
+        <button class="btn stop" onclick="ctl('stop')">إيقاف</button>
+        <div id="result">اضغط تشغيل للبدء</div>
     </div>
     <script>
-        function check() {
-            if(document.getElementById('u').value==='KHOURYBOT' && document.getElementById('p').value==='123456') {
-                document.getElementById('login').style.display='none';
-                document.getElementById('dash').style.display='block';
-                setInterval(upd, 1000);
-            } else alert('Access Denied');
-        }
-        async function ctl(a) { await fetch(`/api/cmd?action=${a}&pair=${document.getElementById('asset').value}`); }
-        async function upd() {
-            document.getElementById('clk').innerText = new Date().toTimeString().split(' ')[0];
+        async function ctl(a) { await fetch(`/api/cmd?action=${a}`); }
+        async function update() {
             const r = await fetch('/api/status');
             const d = await r.json();
-            const disp = document.getElementById('mainDisp');
-            if(d.show) {
-                disp.innerHTML = `<div style="text-align:left">
-                    <b style="color:var(--neon)">${d.isSignal ? d.signal : 'NO SIGNAL'}</b><br>
-                    <small>REASON: ${d.reason}</small><br>
-                    <small>STRENGTH: ${d.strength}%</small><br>
-                    ${d.isSignal ? '<b>ENTRY: ' + d.entry + '</b>' : ''}
-                </div>`;
-            } else { 
-                let m = new Date().getMinutes();
-                let s = new Date().getSeconds();
-                let wait = 4 - (m % 5);
-                disp.innerHTML = `<div style="color:#444">${d.run ? "SCANNING M5... (Next in " + wait + "m " + (50-s) + "s)" : "BOT OFFLINE"}</div>`; 
+            
+            // تحديث العداد
+            let s = new Date().getSeconds();
+            let w = 50 - s; if(w < 0) w += 60;
+            document.getElementById('timer').innerText = w;
+
+            if (d.active) {
+                document.getElementById('result').innerHTML = `<b style="color:#00f3ff">${d.dir}</b><br><small>${d.reason}</small>`;
+            } else if(d.running) {
+                document.getElementById('result').innerHTML = "جاري مراقبة السوق...";
             }
-            document.getElementById('lBox').innerHTML = d.logs.join('<br>');
         }
+        setInterval(update, 1000);
     </script>
 </body>
 </html>
@@ -184,20 +122,17 @@ def home(): return render_template_string(UI)
 @app.route('/api/cmd')
 def cmd():
     bot_config["isRunning"] = (request.args.get('action') == 'start')
-    bot_config["pair_id"] = request.args.get('pair')
-    bot_config["pair_name"] = ASSETS[bot_config["pair_id"]]
     return jsonify({"ok": True})
 
 @app.route('/api/status')
 def get_status():
-    # الرسالة تختفي بعد 30 ثانية
-    show = (time.time() - bot_config["timestamp"]) < 30 and bot_config["timestamp"] > 0
     return jsonify({
-        "run": bot_config["isRunning"], "show": show, "isSignal": bot_config["isSignal"],
-        "signal": bot_config["direction"], "reason": bot_config["reason"], "strength": bot_config["strength"],
-        "pair": bot_config["pair_name"], "entry": bot_config["entryTime"], "logs": bot_config["logs"]
+        "running": bot_config["isRunning"],
+        "active": (time.time() - bot_config["timestamp"]) < 30 and bot_config["timestamp"] > 0,
+        "dir": bot_config["direction"],
+        "reason": bot_config["reason"]
     })
 
 if __name__ == "__main__":
-    threading.Thread(target=smart_ws_worker, daemon=True).start()
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
+    threading.Thread(target=worker, daemon=True).start()
+    app.run(host='0.0.0.0', port=5000)
