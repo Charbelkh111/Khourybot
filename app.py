@@ -11,9 +11,11 @@ app = Flask(__name__)
 # --- إعدادات النظام ---
 bot_config = {
     "isRunning": False,
-    "direction": "WAITING",
-    "reason": "System Initializing...",
-    "pair_name": "EUR/USD",
+    "displayMsg": "WAITING",
+    "direction": "",
+    "reason": "Initializing...",
+    "strength": 0,
+    "pair_name": "",
     "pair_id": "frxEURUSD",
     "timestamp": 0,
     "entryTime": "",
@@ -21,15 +23,13 @@ bot_config = {
     "logs": []
 }
 
-ASSETS = {
-    "frxEURUSD": "EUR/USD", "frxEURJPY": "EUR/JPY", 
-    "frxEURGBP": "EUR/GBP", "frxGBPUSD": "GBP/USD", "frxUSDJPY": "USD/JPY"
-}
+ASSETS = {"frxEURUSD": "EUR/USD", "frxEURJPY": "EUR/JPY", "frxEURGBP": "EUR/GBP"}
 
 def add_log(msg):
     bot_config["logs"].append(f"[{time.strftime('%H:%M:%S')}] {msg}")
     if len(bot_config["logs"]) > 5: bot_config["logs"].pop(0)
 
+# --- حساب مؤشر RSI ---
 def calculate_rsi(prices, period=14):
     if len(prices) < period + 1: return 50
     deltas = [prices[i+1] - prices[i] for i in range(len(prices)-1)]
@@ -39,159 +39,165 @@ def calculate_rsi(prices, period=14):
     rs = up / down
     return 100 - (100 / (1 + rs))
 
+# --- محرك التحليل (RSI + M5 + M1) ---
 def perform_analysis(ticks, times, asset_id):
     global bot_config
     
-    # حساب RSI من آخر 1000 تيك (تقريباً 16 شمعة دقيقة)
+    # تحويل التيكات لشموع دقيقة لـ RSI
     candle_closes = [ticks[i] for i in range(59, len(ticks), 60)]
     rsi_val = calculate_rsi(candle_closes, 14)
     current_price = ticks[-1]
     now = datetime.now()
     
-    # تحديد أسعار البداية
+    # تحديد أسعار البداية لـ 5 دقائق و 1 دقيقة
     start_of_5m = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
     start_of_1m = now.replace(second=0, microsecond=0)
     
     price_at_5m = next((ticks[i] for i, t in enumerate(times) if datetime.fromtimestamp(int(t)) >= start_of_5m), ticks[0])
     price_at_1m = next((ticks[i] for i, t in enumerate(times) if datetime.fromtimestamp(int(t)) >= start_of_1m), ticks[-60] if len(ticks) > 60 else ticks[0])
 
-    reason = ""
+    # شروط الاستراتيجية
     is_call = (rsi_val > 50) and (current_price > price_at_5m) and (current_price > price_at_1m)
     is_put = (rsi_val < 50) and (current_price < price_at_5m) and (current_price < price_at_1m)
 
-    # تحديد سبب الرفض بدقة
-    if not is_call and not is_put:
-        if rsi_val > 45 and rsi_val < 55: reason = "RSI Neutral (Sideways)"
-        elif rsi_val > 50 and current_price < price_at_5m: reason = "M5 Trend is Down (Against RSI)"
-        elif rsi_val < 50 and current_price > price_at_5m: reason = "M5 Trend is Up (Against RSI)"
-        else: reason = "M1/M5 No Sync"
+    reason = "Success"
+    if not (is_call or is_put):
+        if abs(rsi_val - 50) < 5: reason = f"RSI Neutral ({round(rsi_val,1)})"
+        elif rsi_val > 50 and current_price < price_at_5m: reason = "M5 Candle is Red"
+        elif rsi_val < 50 and current_price > price_at_5m: reason = "M5 Candle is Green"
+        else: reason = "M1/M5 Mismatch"
 
     next_entry = (now + timedelta(seconds=10)).strftime("%H:%M")
 
-    # تحديث الحالة فوراً
     bot_config.update({
+        "displayMsg": "SIGNAL FOUND" if (is_call or is_put) else "NO SIGNAL",
         "isSignal": is_call or is_put,
-        "direction": "CALL 🟢" if is_call else ("PUT 🔴" if is_put else "NO SIGNAL"),
-        "reason": "Conditions Met" if (is_call or is_put) else reason,
+        "direction": "CALL 🟢" if is_call else ("PUT 🔴" if is_put else "WAITING"),
+        "reason": reason,
+        "strength": round(rsi_val, 1) if is_call else round(100 - rsi_val, 1),
+        "pair_name": ASSETS[asset_id],
         "timestamp": time.time(),
-        "entryTime": next_entry if (is_call or is_put) else "",
-        "pair_name": ASSETS[asset_id]
+        "entryTime": next_entry if (is_call or is_put) else ""
     })
-    add_log(f"Analysis Done: {bot_config['direction']} | {reason}")
+    add_log(f"Analysis: {bot_config['direction']} | {reason}")
 
+# --- نظام WebSocket (كل 5 دقائق عند الثانية 50) ---
 def smart_ws_worker():
     while True:
         now = datetime.now()
-        # يحلل عند الثانية 50 من كل دقيقة
-        if bot_config["isRunning"] and now.second == 50:
+        # يعمل كل 5 دقائق عند الدقيقة 4, 9, 14...
+        if bot_config["isRunning"] and (now.minute % 5 == 4) and (now.second == 50):
             try:
-                ws = websocket.create_connection("wss://blue.derivws.com/websockets/v3?app_id=16929", timeout=10)
-                ws.send(json.dumps({"ticks_history": bot_config["pair_id"], "count": 1000, "end": "latest", "style": "ticks"}))
+                ws = websocket.create_connection("wss://blue.derivws.com/websockets/v3?app_id=16929", timeout=15)
+                asset = bot_config["pair_id"]
+                ws.send(json.dumps({"ticks_history": asset, "count": 1000, "end": "latest", "style": "ticks"}))
                 res = json.loads(ws.recv())
                 if "history" in res:
-                    perform_analysis(res["history"]["prices"], res["history"]["times"], bot_config["pair_id"])
+                    perform_analysis(res["history"]["prices"], res["history"]["times"], asset)
                 ws.close()
-                time.sleep(2) # تجنب التكرار في نفس الثانية
+                time.sleep(5)
             except Exception as e:
                 add_log(f"Socket Error: {str(e)}")
-        time.sleep(0.1)
+        time.sleep(0.5)
 
+# --- الواجهة الرسومية ---
 UI = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>KHOURY AI V2</title>
+    <title>KHOURY AI PRO</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         :root { --neon: #00f3ff; --green: #39ff14; --red: #ff4757; }
         body { background: #06070a; color: white; font-family: 'Courier New', monospace; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
-        .box { background: #0a0c10; padding: 25px; border-radius: 15px; border: 1px solid var(--neon); width: 340px; text-align: center; box-shadow: 0 0 20px rgba(0,243,255,0.1); }
-        select, .btn { width: 100%; padding: 12px; margin: 10px 0; border-radius: 5px; border: 1px solid var(--neon); background: transparent; color: var(--neon); cursor: pointer; font-weight: bold; }
-        .btn:hover { background: var(--neon); color: #000; }
-        #mainDisp { border: 1px solid #222; margin: 15px 0; padding: 20px; min-height: 120px; border-radius: 10px; background: rgba(255,255,255,0.02); }
-        .log-box { height: 60px; font-size: 10px; color: #555; overflow-y: hidden; text-align: left; border-top: 1px solid #222; padding-top: 10px; }
-        .status-on { color: var(--green); } .status-off { color: var(--red); }
+        #login { position: fixed; inset: 0; background: #020617; z-index: 2000; display: flex; flex-direction: column; justify-content: center; align-items: center; }
+        .box { background: rgba(0,243,255,0.02); padding: 30px; border-radius: 20px; border: 1px solid var(--neon); text-align: center; width: 300px; }
+        input, select { background: #000; border: 1px solid #333; color: var(--neon); padding: 12px; width: 100%; margin-bottom: 15px; border-radius: 8px; text-align: center; }
+        .btn { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--neon); background: transparent; color: var(--neon); font-weight: bold; cursor: pointer; }
+        #dash { display: none; width: 90%; max-width: 400px; text-align: center; }
+        .clock { font-size: 40px; color: var(--neon); margin: 15px 0; }
+        .display-area { border: 2px solid var(--neon); padding: 25px; border-radius: 20px; margin: 20px 0; background: rgba(0,243,255,0.05); min-height: 200px; display: flex; flex-direction: column; justify-content: center; }
+        .logs { background: #000; height: 90px; padding: 10px; font-size: 10px; overflow-y: auto; color: var(--green); border-radius: 10px; text-align: left; border: 1px solid #111; }
     </style>
 </head>
 <body>
-    <div class="box">
-        <h3 style="margin:0; color:var(--neon)">KHOURY AI M1</h3>
-        <p id="statusTxt" class="status-off" style="font-size:12px">● SYSTEM OFFLINE</p>
-        
-        <select id="asset">
-            {% for id, name in assets.items() %}
-            <option value="{{id}}">{{name}}</option>
-            {% endfor %}
-        </select>
-
-        <div id="mainDisp">
-            <div style="font-size:12px; color:#666">WAITING FOR ANALYSIS...</div>
+    <div id="login">
+        <div class="box">
+            <h2 style="color: var(--neon)">KHOURY PRO</h2>
+            <input type="text" id="u" placeholder="ID">
+            <input type="password" id="p" placeholder="PASSWORD">
+            <button class="btn" onclick="check()">LOGIN</button>
         </div>
-
-        <button class="btn" onclick="ctl('start')">START ENGINE</button>
-        <button class="btn" style="border-color:var(--red); color:var(--red)" onclick="ctl('stop')">STOP</button>
-        
-        <div class="log-box" id="lBox"></div>
     </div>
-
+    <div id="dash">
+        <h2 style="color: var(--neon)">RSI TREND AI</h2>
+        <select id="asset">
+            <option value="frxEURUSD">EUR/USD</option>
+            <option value="frxEURJPY">EUR/JPY</option>
+            <option value="frxEURGBP">EUR/GBP</option>
+        </select>
+        <div class="clock" id="clk">00:00:00</div>
+        <div style="display:flex; gap:10px; margin-bottom:20px;">
+            <button class="btn" style="color:var(--green); border-color:var(--green);" onclick="ctl('start')">START</button>
+            <button class="btn" style="color:var(--red); border-color:var(--red);" onclick="ctl('stop')">STOP</button>
+        </div>
+        <div class="display-area" id="mainDisp"></div>
+        <div class="logs" id="lBox"></div>
+    </div>
     <script>
-        async function ctl(a) { 
-            await fetch(`/api/cmd?action=${a}&pair=${document.getElementById('asset').value}`);
-            document.getElementById('statusTxt').innerText = a === 'start' ? "● SYSTEM ACTIVE" : "● SYSTEM OFFLINE";
-            document.getElementById('statusTxt').className = a === 'start' ? "status-on" : "status-off";
+        function check() {
+            if(document.getElementById('u').value==='KHOURYBOT' && document.getElementById('p').value==='123456') {
+                document.getElementById('login').style.display='none';
+                document.getElementById('dash').style.display='block';
+                setInterval(upd, 1000);
+            } else alert('Access Denied');
         }
-
-        async function update() {
+        async function ctl(a) { await fetch(`/api/cmd?action=${a}&pair=${document.getElementById('asset').value}`); }
+        async function upd() {
+            document.getElementById('clk').innerText = new Date().toTimeString().split(' ')[0];
             const r = await fetch('/api/status');
             const d = await r.json();
             const disp = document.getElementById('mainDisp');
-            
-            if (d.active_msg) {
-                let color = d.isSignal ? "var(--green)" : "var(--red)";
+            if(d.show) {
                 disp.innerHTML = `<div style="text-align:left">
-                    <b style="color:${color}">${d.direction}</b><br>
-                    <small>Pair: ${d.pair}</small><br>
-                    <small>Reason: ${d.reason}</small><br>
+                    <b style="color:var(--neon)">${d.isSignal ? d.signal : 'NO SIGNAL'}</b><br>
+                    <small>REASON: ${d.reason}</small><br>
+                    <small>STRENGTH: ${d.strength}%</small><br>
                     ${d.isSignal ? '<b>ENTRY: ' + d.entry + '</b>' : ''}
                 </div>`;
-            } else {
-                let sec = new Date().getSeconds();
-                let wait = 50 - sec;
-                if (wait < 0) wait = 60 + wait;
-                disp.innerHTML = `<div style="color:#444">NEXT ANALYSIS IN:<br><span style="font-size:25px">${wait}s</span></div>`;
+            } else { 
+                let m = new Date().getMinutes();
+                let s = new Date().getSeconds();
+                let wait = 4 - (m % 5);
+                disp.innerHTML = `<div style="color:#444">${d.run ? "SCANNING M5... (Next in " + wait + "m " + (50-s) + "s)" : "BOT OFFLINE"}</div>`; 
             }
             document.getElementById('lBox').innerHTML = d.logs.join('<br>');
         }
-        setInterval(update, 1000);
     </script>
 </body>
 </html>
 """
 
 @app.route('/')
-def home(): return render_template_string(UI, assets=ASSETS)
+def home(): return render_template_string(UI)
 
 @app.route('/api/cmd')
 def cmd():
     bot_config["isRunning"] = (request.args.get('action') == 'start')
     bot_config["pair_id"] = request.args.get('pair')
-    if not bot_config["isRunning"]: bot_config["timestamp"] = 0
+    bot_config["pair_name"] = ASSETS[bot_config["pair_id"]]
     return jsonify({"ok": True})
 
 @app.route('/api/status')
 def get_status():
-    # تظهر الرسالة لمدة 30 ثانية بعد التحليل
-    active_msg = (time.time() - bot_config["timestamp"]) < 30 and bot_config["timestamp"] > 0
+    # الرسالة تختفي بعد 30 ثانية
+    show = (time.time() - bot_config["timestamp"]) < 30 and bot_config["timestamp"] > 0
     return jsonify({
-        "active_msg": active_msg,
-        "isSignal": bot_config["isSignal"],
-        "direction": bot_config["direction"],
-        "reason": bot_config["reason"],
-        "pair": bot_config["pair_name"],
-        "entry": bot_config["entryTime"],
-        "logs": bot_config["logs"]
+        "run": bot_config["isRunning"], "show": show, "isSignal": bot_config["isSignal"],
+        "signal": bot_config["direction"], "reason": bot_config["reason"], "strength": bot_config["strength"],
+        "pair": bot_config["pair_name"], "entry": bot_config["entryTime"], "logs": bot_config["logs"]
     })
 
 if __name__ == "__main__":
     threading.Thread(target=smart_ws_worker, daemon=True).start()
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
